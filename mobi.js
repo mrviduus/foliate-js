@@ -1180,6 +1180,12 @@ class KF8 {
             this.#type = MIME.HTML
             doc = this.parser.parseFromString(replaced, this.#type)
         }
+        // as for resources (loadResourceBlob) and EPUB sections, a listener may
+        // rewrite the section's markup; dispatched once its type is known
+        const detail = { data: replaced, type: this.#type }
+        this.transformTarget.dispatchEvent(new CustomEvent('data', { detail }))
+        const data = await detail.data
+        if (data !== replaced) doc = this.parser.parseFromString(data, this.#type)
         for (const [url, node] of this.#inlineMap) {
             for (const el of doc.querySelectorAll(`img[src="${url}"]`))
                 el.replaceWith(node)
