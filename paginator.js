@@ -752,7 +752,9 @@ export class Paginator extends HTMLElement {
         return { height, width, margin, gap, columnWidth }
     }
     render() {
-        if (!this.#view) return
+        // TextStack patch (apps/mobile/src/lib/v2reader/patches/): the current view can still be loading
+        // (body null) when a resize or attribute change renders; its load handler renders again.
+        if (!this.#view?.document?.body) return
         this.#view.render(this.#beforeRender({
             vertical: this.#vertical,
             rtl: this.#rtl,
