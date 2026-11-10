@@ -2,15 +2,21 @@ const pdfjsPath = path => new URL(`vendor/pdfjs/${path}`, import.meta.url).toStr
 
 import './vendor/pdfjs/pdf.mjs'
 const pdfjsLib = globalThis.pdfjsLib
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsPath('pdf.worker.mjs')
 
 const fetchText = async url => await (await fetch(url)).text()
 
+// Nothing is fetched or resolved at import time: a host that bundles this module (no module URL,
+// no network under its CSP) passes its own CSS and getDocument params to `makePDF` instead.
 // https://raw.githubusercontent.com/mozilla/pdf.js/refs/tags/v5.5.207/web/text_layer_builder.css
-const textLayerBuilderCSS = await fetchText(pdfjsPath('text_layer_builder.css'))
-
 // https://raw.githubusercontent.com/mozilla/pdf.js/refs/tags/v5.5.207/web/annotation_layer_builder.css
-const annotationLayerBuilderCSS = await fetchText(pdfjsPath('annotation_layer_builder.css'))
+let defaultCSS
+const getDefaultCSS = () => defaultCSS ??= Promise.all(
+    ['text_layer_builder.css', 'annotation_layer_builder.css'].map(f => fetchText(pdfjsPath(f))))
+    .then(css => css.join('\n'))
+const defaultParams = () => ({
+    cMapUrl: pdfjsPath('cmaps/'),
+    standardFontDataUrl: pdfjsPath('standard_fonts/'),
+})
 
 const render = async (page, doc, zoom) => {
     const scale = zoom * devicePixelRatio
@@ -66,7 +72,7 @@ const render = async (page, doc, zoom) => {
         .render({ annotations: await page.getAnnotations() })
 }
 
-const renderPage = async (page, getImageBlob) => {
+const renderPage = async (page, getImageBlob, css) => {
     const viewport = page.getViewport({ scale: 1 })
     if (getImageBlob) {
         const canvas = document.createElement('canvas')
@@ -95,8 +101,7 @@ const renderPage = async (page, getImageBlob) => {
           --scale-round-x: 1px;
           --scale-round-y: 1px;
         }
-        ${textLayerBuilderCSS}
-        ${annotationLayerBuilderCSS}
+        ${css}
         </style>
         <div id="canvas"></div>
         <div class="textLayer"></div>
@@ -112,7 +117,16 @@ const makeTOCItem = item => ({
     subitems: item.items.length ? item.items.map(makeTOCItem) : null,
 })
 
-export const makePDF = async file => {
+/**
+ * `options.css`: the text and annotation layer CSS (default: fetched from `vendor/pdfjs/`).
+ * `options.params`: getDocument params (default: cMaps and standard fonts from `vendor/pdfjs/`).
+ * The worker is `GlobalWorkerOptions.workerSrc`, unless the host set one up on `globalThis.pdfjsWorker`
+ * (pdf.js then runs it on the main thread). Eval stays off (`isEvalSupported: false`, not overridable).
+ */
+export const makePDF = async (file, { css, params } = {}) => {
+    if (!pdfjsLib.GlobalWorkerOptions.workerSrc && !globalThis.pdfjsWorker)
+        pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsPath('pdf.worker.mjs')
+    css ??= await getDefaultCSS()
     const transport = new pdfjsLib.PDFDataRangeTransport(file.size, [])
     transport.requestDataRange = (begin, end) => {
         file.slice(begin, end).arrayBuffer().then(chunk => {
@@ -121,8 +135,7 @@ export const makePDF = async file => {
     }
     const pdf = await pdfjsLib.getDocument({
         range: transport,
-        cMapUrl: pdfjsPath('cmaps/'),
-        standardFontDataUrl: pdfjsPath('standard_fonts/'),
+        ...(params ?? defaultParams()),
         isEvalSupported: false,
     }).promise
 
@@ -152,7 +165,7 @@ export const makePDF = async file => {
         load: async () => {
             const cached = cache.get(i)
             if (cached) return cached
-            const url = await renderPage(await pdf.getPage(i + 1))
+            const url = await renderPage(await pdf.getPage(i + 1), false, css)
             cache.set(i, url)
             return url
         },
