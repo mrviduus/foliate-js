@@ -952,6 +952,9 @@ export class Paginator extends HTMLElement {
             this.start - size, this.end - size, this.#getRectMapper())
     }
     #afterScroll(reason) {
+        // (the view may be gone by then: destroy() sets it to null, and the
+        // debounced scroll listener can still fire after it)
+        if (!this.#view) return
         const range = this.#getVisibleRange()
         this.#lastVisibleRange = range
         // don't set new anchor if relocation was to scroll to anchor
