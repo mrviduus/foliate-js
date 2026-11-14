@@ -439,7 +439,7 @@ export class Paginator extends HTMLElement {
     #margin = 0
     #index = -1
     #anchor = 0 // anchor view to a fraction (0-1), Range, or Element
-    #justAnchored = false
+    #justAnchored = null // the scroll offset an anchored relocate left, or null
     #locked = false // while true, prevent any further navigation
     #styles
     #styleMap = new WeakMap()
@@ -559,8 +559,11 @@ export class Paginator extends HTMLElement {
         this.#container.addEventListener('scroll', () => this.dispatchEvent(new Event('scroll')))
         this.#container.addEventListener('scroll', debounce(() => {
             if (this.scrolled) {
-                if (this.#justAnchored) this.#justAnchored = false
-                else this.#afterScroll('scroll')
+                // swallow only the scroll the anchoring itself caused: the
+                // reader's own scroll has moved the container off its offset
+                const anchored = this.#justAnchored === this.#container[this.scrollProp]
+                this.#justAnchored = null
+                if (!anchored) this.#afterScroll('scroll')
             }
         }, 250))
 
@@ -960,7 +963,7 @@ export class Paginator extends HTMLElement {
         // don't set new anchor if relocation was to scroll to anchor
         if (reason !== 'selection' && reason !== 'navigation' && reason !== 'anchor')
             this.#anchor = range
-        else this.#justAnchored = true
+        else this.#justAnchored = this.#container[this.scrollProp]
 
         const index = this.#index
         const detail = { reason, range, index }
