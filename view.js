@@ -527,16 +527,32 @@ export class View extends HTMLElement {
         for (const { range, excerpt } of matcher(doc, query))
             yield { cfi: this.getCFI(index, range), excerpt }
     }
-    async * #searchBook(matcher, query) {
+    // `limit`: stop matching once that many hits are found (default: all of them).
+    async * #searchBook(matcher, query, limit = Infinity) {
         const { sections } = this.book
+        let found = 0
         for (const [index, { createDocument }] of sections.entries()) {
             if (!createDocument) continue
-            const doc = await createDocument()
-            const subitems = Array.from(matcher(doc, query), ({ range, excerpt }) =>
-                ({ cfi: this.getCFI(index, range), excerpt }))
+            const subitems = []
+            try {
+                const doc = await createDocument()
+                for (const { range, excerpt } of matcher(doc, query)) {
+                    subitems.push({
+                        cfi: this.getCFI(index, range), excerpt,
+                        // the contents entry the hit is under, not the file's first
+                        label: this.#tocProgress.getProgress(index, range)?.label ?? '',
+                    })
+                    if (++found >= limit) break
+                }
+            } catch (error) {
+                // a section that cannot be read (no body, a failed load) is skipped
+                yield { index, error }
+                continue
+            }
             const progress = (index + 1) / sections.length
             yield { progress }
             if (subitems.length) yield { index, subitems }
+            if (found >= limit) return
         }
     }
     async * search(opts) {
@@ -549,7 +565,7 @@ export class View extends HTMLElement {
             { defaultLocale: this.language, ...opts })
         const iter = index != null
             ? this.#searchSection(matcher, query, index)
-            : this.#searchBook(matcher, query)
+            : this.#searchBook(matcher, query, opts.limit)
 
         const list = []
         this.#searchResults.set(index, list)
