@@ -227,9 +227,12 @@ export const makePDF = async (file, { css, params, worker: makeWorker, silence =
             heard()
         })
     })
-    // a worker that cannot start (refused, a script error) fails the load at once, not at the watchdog
-    const failed = () => kill(new Error('the PDF reader could not start'))
+    // a worker that cannot start (refused, a script error) fails the load at once, not at the watchdog; one that dies
+    // later (an uncaught error, a message it cannot read) is the book stopped, at once
+    let loaded = false
+    const failed = () => kill(new Error(loaded ? 'the PDF reader stopped' : 'the PDF reader could not start'))
     webWorker?.addEventListener('error', failed)
+    webWorker?.addEventListener('messageerror', failed)
     const task = pdfjsLib.getDocument({
         ...source,
         ...(params ?? defaultParams()),
@@ -244,7 +247,7 @@ export const makePDF = async (file, { css, params, worker: makeWorker, silence =
         throw e
     })
     const pdf = await orDestroy(task.promise)
-    webWorker?.removeEventListener('error', failed)
+    loaded = true
 
     const book = { rendition: { layout: 'pre-paginated' } }
 
@@ -293,10 +296,13 @@ export const makePDF = async (file, { css, params, worker: makeWorker, silence =
                 unloaded.add(src)
                 return { src, onZoom: zoom => {
                     if (unloaded.delete(src)) URL.revokeObjectURL(src)
-                    // a render the terminated worker never answers is reported once, by `onFail`; a cancelled
-                    // one (no longer wanted) is no error
+                    // a cancelled render (no longer wanted) is no error. Any other failure is the book stopped
+                    // (reported once, by `onFail`), never a blank page nobody hears of: pdf.js draws past what it
+                    // can ignore (stopAtErrors off), so a page that still fails is one the worker could not do
+                    // (out of memory: pdf.js answers its text with "Array buffer allocation failed")
                     return onZoom(zoom).catch(e => {
-                        if (!dead && e?.name !== 'RenderingCancelledException') throw e
+                        if (e?.name !== 'RenderingCancelledException')
+                            kill(new Error(`this page could not be drawn: ${e?.message ?? e}`))
                     })
                 } }
             })
