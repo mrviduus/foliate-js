@@ -239,29 +239,34 @@ export const makePDF = async (file, { css, params, worker: makeWorker, deadline 
     let toc
     book.getTOC = () => toc ??= answer(pdf.getOutline()).then(outline => book.toc = outline?.map(makeTOCItem) ?? [])
 
-    // the last `KEEP_PAGES` loaded pages, least recently loaded first; an older one gives back its
-    // `blob:` URL and pdf.js's resources for it (`cleanup()` waits for a render in progress), and is
-    // rebuilt when visited again
+    // the last `KEEP_PAGES` loaded pages, least recently loaded first; an older one gives back pdf.js's
+    // resources for it (`cleanup()` waits for a render in progress), fetched again when visited.
+    // Each load hands out a `blob:` document of its own, revoked once its frame has loaded it (the first
+    // `onZoom` on it), never by the eviction: a jump of `KEEP_PAGES` pages while a frame still loads
+    // would revoke its URL first. One whose frame never loads (replaced before) goes at `destroy`.
     const cache = new Map()
-    const release = entry => entry.then(({ page, src }) => {
-        URL.revokeObjectURL(src)
-        page.cleanup()
-    }, () => {})
+    const unloaded = new Set()
     book.sections = Array.from({ length: pdf.numPages }).map((_, i) => ({
         id: i,
         load: () => {
             const cached = cache.get(i)
             cache.delete(i)
-            const entry = cached ?? answer(pdf.getPage(i + 1)).then(async page =>
-                ({ page, ...await renderPage(page, false, css, answer) }))
+            const entry = cached ?? answer(pdf.getPage(i + 1))
             cache.set(i, entry)
             entry.catch(() => cache.get(i) === entry && cache.delete(i))
             for (const [j, old] of cache) {
                 if (cache.size <= KEEP_PAGES) break
                 cache.delete(j)
-                release(old)
+                old.then(page => page.cleanup(), () => {})
             }
-            return entry.then(({ src, onZoom }) => ({ src, onZoom }))
+            return entry.then(async page => {
+                const { src, onZoom } = await renderPage(page, false, css, answer)
+                unloaded.add(src)
+                return { src, onZoom: zoom => {
+                    if (unloaded.delete(src)) URL.revokeObjectURL(src)
+                    return onZoom(zoom)
+                } }
+            })
         },
         size: 1000,
     }))
@@ -285,8 +290,8 @@ export const makePDF = async (file, { css, params, worker: makeWorker, deadline 
     book.getTOCFragment = doc => doc.documentElement
     book.getCover = async () => renderPage(await answer(pdf.getPage(1)), true, null, answer)
     book.destroy = () => {
-        for (const entry of cache.values())
-            entry.then(({ src }) => URL.revokeObjectURL(src), () => {})
+        for (const src of unloaded) URL.revokeObjectURL(src)
+        unloaded.clear()
         cache.clear()
         return close()
     }
