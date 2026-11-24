@@ -161,15 +161,21 @@ export const makePDF = async (file, { css, params } = {}) => {
             transport.onDataRange(begin, chunk)
         })
     }
-    const pdf = await pdfjsLib.getDocument({
+    const task = pdfjsLib.getDocument({
         range: transport,
         ...(params ?? defaultParams()),
         isEvalSupported: false,
-    }).promise
+    })
+    // a load that fails before the book is made destroys its own loading task (and worker port)
+    const orDestroy = promise => promise.catch(e => {
+        task.destroy()
+        throw e
+    })
+    const pdf = await orDestroy(task.promise)
 
     const book = { rendition: { layout: 'pre-paginated' } }
 
-    const { metadata, info } = await pdf.getMetadata() ?? {}
+    const { metadata, info } = await orDestroy(pdf.getMetadata()) ?? {}
     // TODO: for better results, parse `metadata.getRaw()`
     book.metadata = {
         title: metadata?.get('dc:title') ?? info?.Title,
@@ -184,7 +190,7 @@ export const makePDF = async (file, { css, params } = {}) => {
         rights: metadata?.get('dc:rights'),
     }
 
-    const outline = await pdf.getOutline()
+    const outline = await orDestroy(pdf.getOutline())
     book.toc = outline?.map(makeTOCItem)
 
     // the last `KEEP_PAGES` loaded pages, least recently loaded first; an older one gives back its
