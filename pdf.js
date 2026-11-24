@@ -234,8 +234,10 @@ export const makePDF = async (file, { css, params, worker: makeWorker, deadline 
         rights: metadata?.get('dc:rights'),
     }
 
-    const outline = await orDestroy(pdf.getOutline())
-    book.toc = outline?.map(makeTOCItem)
+    // the outline is read when asked for, not before the book is made: a huge one would hold up the
+    // first page; `getTOC()` sets `book.toc` (and resolves with it), then `view.updateTOC()` uses it
+    let toc
+    book.getTOC = () => toc ??= answer(pdf.getOutline()).then(outline => book.toc = outline?.map(makeTOCItem) ?? [])
 
     // the last `KEEP_PAGES` loaded pages, least recently loaded first; an older one gives back its
     // `blob:` URL and pdf.js's resources for it (`cleanup()` waits for a render in progress), and is

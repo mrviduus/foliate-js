@@ -238,16 +238,9 @@ export class View extends HTMLElement {
         this.language = languageInfo(book.metadata?.language)
 
         if (book.splitTOCHref && book.getTOCFragment) {
-            const ids = book.sections.map(s => s.id)
             this.#sectionProgress = new SectionProgress(book.sections, 1500, 1600)
-            const splitHref = book.splitTOCHref.bind(book)
-            const getFragment = book.getTOCFragment.bind(book)
-            this.#tocProgress = new TOCProgress()
-            await this.#tocProgress.init({
-                toc: book.toc ?? [], ids, splitHref, getFragment })
-            this.#pageProgress = new TOCProgress()
-            await this.#pageProgress.init({
-                toc: book.pageList ?? [], ids, splitHref, getFragment })
+            this.#tocProgress = await this.#makeTOCProgress(book.toc)
+            this.#pageProgress = await this.#makeTOCProgress(book.pageList)
         }
 
         this.isFixedLayout = this.book.rendition?.layout === 'pre-paginated'
@@ -293,6 +286,21 @@ export class View extends HTMLElement {
                 }
             })
         }
+    }
+    async #makeTOCProgress(toc) {
+        const { book } = this
+        const progress = new TOCProgress()
+        await progress.init({ toc: toc ?? [], ids: book.sections.map(s => s.id),
+            splitHref: book.splitTOCHref.bind(book), getFragment: book.getTOCFragment.bind(book) })
+        return progress
+    }
+    // a book whose contents come after it opened (a PDF's outline, `book.getTOC()`): its TOC
+    // progress again, from `book.toc` as it is now
+    async updateTOC() {
+        const { book } = this
+        if (!book?.splitTOCHref || !book.getTOCFragment) return
+        const progress = await this.#makeTOCProgress(book.toc)
+        if (this.book === book) this.#tocProgress = progress
     }
     close() {
         this.renderer?.destroy()
