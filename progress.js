@@ -20,8 +20,10 @@ export class TOCProgress {
         assignIDs(toc)
         const items = flatten(toc)
         const grouped = new Map()
+        // in parallel: one round trip each in turn kept a PDF with thousands of bookmarks from opening
+        const split = await Promise.all(items.map(item => splitHref(item?.href)))
         for (const [i, item] of items.entries()) {
-            const [id, fragment] = await splitHref(item?.href) ?? []
+            const [id, fragment] = split[i] ?? []
             const value = { fragment, item }
             if (grouped.has(id)) grouped.get(id).items.push(value)
             else grouped.set(id, { prev: items[i - 1], items: [value] })
