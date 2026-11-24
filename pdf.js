@@ -152,12 +152,16 @@ const makeTOCItem = item => ({
  * `options.worker`: a function that makes a Web Worker running pdf.worker (the host's own, e.g. from a `blob:`
  * URL), one per document, terminated with it. Otherwise the worker is `GlobalWorkerOptions.workerSrc`, unless
  * the host set one up on `globalThis.pdfjsWorker` (pdf.js then runs it on the main thread).
- * `options.deadline` (ms, 0 = none): a parse or render pdf.js's worker does not answer in that time terminates
- * the host's worker; every call in flight and every later one reject (a decompression bomb fails instead of
- * running on). Without `options.worker` the call only rejects: there is no worker of ours to terminate.
+ * `options.deadline` (ms, 0 = none): a parse (the load, metadata, the outline) pdf.js's worker does not answer in
+ * that time terminates the host's worker; every call in flight and every later one reject (a decompression bomb
+ * fails instead of running on). `options.pageDeadline` (default `deadline`): the same for each call about one page
+ * (the page, its render, text and annotations, the cover), each call timed on its own: a heavy page gets its own
+ * budget, not what is left of another's. `options.onFail(error)`: called once when the worker is terminated
+ * (a book already on screen stops answering; the host should say so). Without `options.worker` a call only
+ * rejects: there is no worker of ours to terminate.
  * Eval stays off (`isEvalSupported: false`, not overridable).
  */
-export const makePDF = async (file, { css, params, worker: makeWorker, deadline = 0 } = {}) => {
+export const makePDF = async (file, { css, params, worker: makeWorker, deadline = 0, pageDeadline = deadline, onFail } = {}) => {
     if (!makeWorker && !pdfjsLib.GlobalWorkerOptions.workerSrc && !globalThis.pdfjsWorker)
         pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsPath('pdf.worker.mjs')
     css ??= await getDefaultCSS()
@@ -188,6 +192,7 @@ export const makePDF = async (file, { css, params, worker: makeWorker, deadline 
         terminate()
         for (const reject of pending) reject(error)
         pending.clear()
+        onFail?.(error)
     }
     /** `promise` (an answer from the worker), or a rejection: the worker is dead, or did not answer in `ms` */
     const answer = (promise, ms = deadline) => dead ? Promise.reject(dead) : new Promise((resolve, reject) => {
@@ -198,6 +203,7 @@ export const makePDF = async (file, { css, params, worker: makeWorker, deadline 
             pending.delete(reject)
         })
     })
+    const pageAnswer = promise => answer(promise, pageDeadline)
     // a worker that cannot start (refused, a script error) fails the load at once, not at the deadline
     const failed = () => kill(new Error('the PDF reader could not start'))
     webWorker?.addEventListener('error', failed)
@@ -251,7 +257,7 @@ export const makePDF = async (file, { css, params, worker: makeWorker, deadline 
         load: () => {
             const cached = cache.get(i)
             cache.delete(i)
-            const entry = cached ?? answer(pdf.getPage(i + 1))
+            const entry = cached ?? pageAnswer(pdf.getPage(i + 1))
             cache.set(i, entry)
             entry.catch(() => cache.get(i) === entry && cache.delete(i))
             for (const [j, old] of cache) {
@@ -260,11 +266,14 @@ export const makePDF = async (file, { css, params, worker: makeWorker, deadline 
                 old.then(page => page.cleanup(), () => {})
             }
             return entry.then(async page => {
-                const { src, onZoom } = await renderPage(page, false, css, answer)
+                const { src, onZoom } = await renderPage(page, false, css, pageAnswer)
                 unloaded.add(src)
                 return { src, onZoom: zoom => {
                     if (unloaded.delete(src)) URL.revokeObjectURL(src)
-                    return onZoom(zoom)
+                    // a render the terminated worker never answers is reported once, by `onFail`
+                    return onZoom(zoom).catch(e => {
+                        if (!dead) throw e
+                    })
                 } }
             })
         },
@@ -288,7 +297,7 @@ export const makePDF = async (file, { css, params, worker: makeWorker, deadline 
         return [index, null]
     }
     book.getTOCFragment = doc => doc.documentElement
-    book.getCover = async () => renderPage(await answer(pdf.getPage(1)), true, null, answer)
+    book.getCover = async () => renderPage(await pageAnswer(pdf.getPage(1)), true, null, pageAnswer)
     book.destroy = () => {
         for (const src of unloaded) URL.revokeObjectURL(src)
         unloaded.clear()
