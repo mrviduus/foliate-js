@@ -137,6 +137,8 @@ const renderPage = async (page, getImageBlob, css) => {
     return { src, onZoom }
 }
 
+const KEEP_PAGES = 4
+
 const makeTOCItem = item => ({
     label: item.title,
     href: JSON.stringify(item.dest),
@@ -185,15 +187,29 @@ export const makePDF = async (file, { css, params } = {}) => {
     const outline = await pdf.getOutline()
     book.toc = outline?.map(makeTOCItem)
 
+    // the last `KEEP_PAGES` loaded pages, least recently loaded first; an older one gives back its
+    // `blob:` URL and pdf.js's resources for it (`cleanup()` waits for a render in progress), and is
+    // rebuilt when visited again
     const cache = new Map()
+    const release = entry => entry.then(({ page, src }) => {
+        URL.revokeObjectURL(src)
+        page.cleanup()
+    }, () => {})
     book.sections = Array.from({ length: pdf.numPages }).map((_, i) => ({
         id: i,
-        load: async () => {
+        load: () => {
             const cached = cache.get(i)
-            if (cached) return cached
-            const url = await renderPage(await pdf.getPage(i + 1), false, css)
-            cache.set(i, url)
-            return url
+            cache.delete(i)
+            const entry = cached ?? pdf.getPage(i + 1).then(async page =>
+                ({ page, ...await renderPage(page, false, css) }))
+            cache.set(i, entry)
+            entry.catch(() => cache.get(i) === entry && cache.delete(i))
+            for (const [j, old] of cache) {
+                if (cache.size <= KEEP_PAGES) break
+                cache.delete(j)
+                release(old)
+            }
+            return entry.then(({ src, onZoom }) => ({ src, onZoom }))
         },
         size: 1000,
     }))
@@ -216,6 +232,11 @@ export const makePDF = async (file, { css, params } = {}) => {
     }
     book.getTOCFragment = doc => doc.documentElement
     book.getCover = async () => renderPage(await pdf.getPage(1), true)
-    book.destroy = () => pdf.destroy()
+    book.destroy = () => {
+        for (const entry of cache.values())
+            entry.then(({ src }) => URL.revokeObjectURL(src), () => {})
+        cache.clear()
+        return pdf.destroy()
+    }
     return book
 }
