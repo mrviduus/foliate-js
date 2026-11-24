@@ -22,7 +22,7 @@ const defaultParams = () => ({
 // resize, so each call builds its own layers and only the latest one puts them in
 const latestRender = new WeakMap()
 
-const render = async (page, doc, zoom) => {
+const render = async (page, doc, zoom, answer) => {
     const token = {}
     latestRender.set(doc, token)
     const stale = () => latestRender.get(doc) !== token
@@ -38,7 +38,7 @@ const render = async (page, doc, zoom) => {
     canvas.height = viewport.height
     canvas.width = viewport.width
     const canvasContext = canvas.getContext('2d')
-    await page.render({ canvasContext, viewport }).promise
+    await answer(page.render({ canvasContext, viewport }).promise)
     if (stale()) return
     doc.querySelector('#canvas').replaceChildren(doc.adoptNode(canvas))
 
@@ -48,7 +48,7 @@ const render = async (page, doc, zoom) => {
         textContentSource: await page.streamTextContent(),
         container, viewport,
     })
-    await textLayer.render()
+    await answer(textLayer.render())
 
     // hide "offscreen" canvases appended to docuemnt when rendering text layer
     // https://github.com/mozilla/pdf.js/blob/642b9a5ae67ef642b9a8808fd9efd447e8c350e2/web/pdf_viewer.css#L51-L58
@@ -92,20 +92,20 @@ const render = async (page, doc, zoom) => {
         executeSetOCGState: () => {},
     }
     await new pdfjsLib.AnnotationLayer({ page, viewport, div, linkService })
-        .render({ annotations: await page.getAnnotations() })
+        .render({ annotations: await answer(page.getAnnotations()) })
     if (stale()) return
     doc.querySelector('.textLayer').replaceWith(container)
     doc.querySelector('.annotationLayer').replaceWith(div)
 }
 
-const renderPage = async (page, getImageBlob, css) => {
+const renderPage = async (page, getImageBlob, css, answer) => {
     const viewport = page.getViewport({ scale: 1 })
     if (getImageBlob) {
         const canvas = document.createElement('canvas')
         canvas.height = viewport.height
         canvas.width = viewport.width
         const canvasContext = canvas.getContext('2d')
-        await page.render({ canvasContext, viewport }).promise
+        await answer(page.render({ canvasContext, viewport }).promise)
         return new Promise(resolve => canvas.toBlob(resolve))
     }
     const src = URL.createObjectURL(new Blob([`
@@ -133,7 +133,7 @@ const renderPage = async (page, getImageBlob, css) => {
         <div class="textLayer"></div>
         <div class="annotationLayer"></div>
     `], { type: 'text/html' }))
-    const onZoom = ({ doc, scale }) => render(page, doc, scale)
+    const onZoom = ({ doc, scale }) => render(page, doc, scale, answer)
     return { src, onZoom }
 }
 
@@ -149,11 +149,16 @@ const makeTOCItem = item => ({
  * `file`: a `File` (read in ranges) or the bytes (`Uint8Array`, `ArrayBuffer`), transferred to pdf.js's worker.
  * `options.css`: the text and annotation layer CSS (default: fetched from `vendor/pdfjs/`).
  * `options.params`: getDocument params (default: cMaps and standard fonts from `vendor/pdfjs/`).
- * The worker is `GlobalWorkerOptions.workerSrc`, unless the host set one up on `globalThis.pdfjsWorker`
- * (pdf.js then runs it on the main thread). Eval stays off (`isEvalSupported: false`, not overridable).
+ * `options.worker`: a function that makes a Web Worker running pdf.worker (the host's own, e.g. from a `blob:`
+ * URL), one per document, terminated with it. Otherwise the worker is `GlobalWorkerOptions.workerSrc`, unless
+ * the host set one up on `globalThis.pdfjsWorker` (pdf.js then runs it on the main thread).
+ * `options.deadline` (ms, 0 = none): a parse or render pdf.js's worker does not answer in that time terminates
+ * the host's worker; every call in flight and every later one reject (a decompression bomb fails instead of
+ * running on). Without `options.worker` the call only rejects: there is no worker of ours to terminate.
+ * Eval stays off (`isEvalSupported: false`, not overridable).
  */
-export const makePDF = async (file, { css, params } = {}) => {
-    if (!pdfjsLib.GlobalWorkerOptions.workerSrc && !globalThis.pdfjsWorker)
+export const makePDF = async (file, { css, params, worker: makeWorker, deadline = 0 } = {}) => {
+    if (!makeWorker && !pdfjsLib.GlobalWorkerOptions.workerSrc && !globalThis.pdfjsWorker)
         pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsPath('pdf.worker.mjs')
     css ??= await getDefaultCSS()
     // bytes the host already holds (a `Uint8Array` or `ArrayBuffer`) go to pdf.js as `data`: transferred to
@@ -168,17 +173,49 @@ export const makePDF = async (file, { css, params } = {}) => {
         }
         source = { range: transport }
     } else source = { data: file instanceof ArrayBuffer ? new Uint8Array(file) : file }
+    const webWorker = makeWorker?.()
+    const worker = webWorker && new pdfjsLib.PDFWorker({ port: webWorker })
+    // `dead`: the worker was terminated; nothing it was asked answers any more
+    let dead = null
+    const pending = new Set()
+    const terminate = () => {
+        worker?.destroy()
+        webWorker?.terminate()
+    }
+    const kill = error => {
+        if (dead) return
+        dead = error
+        terminate()
+        for (const reject of pending) reject(error)
+        pending.clear()
+    }
+    /** `promise` (an answer from the worker), or a rejection: the worker is dead, or did not answer in `ms` */
+    const answer = (promise, ms = deadline) => dead ? Promise.reject(dead) : new Promise((resolve, reject) => {
+        pending.add(reject)
+        const timer = ms && setTimeout(() => kill(new Error('this PDF took too long to read')), ms)
+        promise.then(resolve, reject).finally(() => {
+            clearTimeout(timer)
+            pending.delete(reject)
+        })
+    })
+    // a worker that cannot start (refused, a script error) fails the load at once, not at the deadline
+    const failed = () => kill(new Error('the PDF reader could not start'))
+    webWorker?.addEventListener('error', failed)
     const task = pdfjsLib.getDocument({
         ...source,
         ...(params ?? defaultParams()),
+        worker,
         isEvalSupported: false,
     })
-    // a load that fails before the book is made destroys its own loading task (and worker port)
-    const orDestroy = promise => promise.catch(e => {
-        task.destroy()
+    // the document and its worker go; a worker that does not answer the destroy is terminated anyway
+    const close = () => answer(task.destroy()).catch(() => {}).finally(terminate)
+    // a load that fails before the book is made destroys its own loading task and worker
+    const orDestroy = promise => answer(promise).catch(e => {
+        close()
         throw e
     })
     const pdf = await orDestroy(task.promise)
+    webWorker?.removeEventListener('error', failed)
 
     const book = { rendition: { layout: 'pre-paginated' } }
 
@@ -213,8 +250,8 @@ export const makePDF = async (file, { css, params } = {}) => {
         load: () => {
             const cached = cache.get(i)
             cache.delete(i)
-            const entry = cached ?? pdf.getPage(i + 1).then(async page =>
-                ({ page, ...await renderPage(page, false, css) }))
+            const entry = cached ?? answer(pdf.getPage(i + 1)).then(async page =>
+                ({ page, ...await renderPage(page, false, css, answer) }))
             cache.set(i, entry)
             entry.catch(() => cache.get(i) === entry && cache.delete(i))
             for (const [j, old] of cache) {
@@ -230,26 +267,26 @@ export const makePDF = async (file, { css, params } = {}) => {
     book.resolveHref = async href => {
         const parsed = JSON.parse(href)
         const dest = typeof parsed === 'string'
-            ? await pdf.getDestination(parsed) : parsed
+            ? await answer(pdf.getDestination(parsed), 0) : parsed
         if (dest?.[0] == null) return null
-        const index = await pdf.getPageIndex(dest[0])
+        const index = await answer(pdf.getPageIndex(dest[0]), 0)
         return { index }
     }
     book.splitTOCHref = async href => {
         const parsed = JSON.parse(href)
         const dest = typeof parsed === 'string'
-            ? await pdf.getDestination(parsed) : parsed
+            ? await answer(pdf.getDestination(parsed), 0) : parsed
         if (dest?.[0] == null) return null
-        const index = await pdf.getPageIndex(dest[0])
+        const index = await answer(pdf.getPageIndex(dest[0]), 0)
         return [index, null]
     }
     book.getTOCFragment = doc => doc.documentElement
-    book.getCover = async () => renderPage(await pdf.getPage(1), true)
+    book.getCover = async () => renderPage(await answer(pdf.getPage(1)), true, null, answer)
     book.destroy = () => {
         for (const entry of cache.values())
             entry.then(({ src }) => URL.revokeObjectURL(src), () => {})
         cache.clear()
-        return pdf.destroy()
+        return close()
     }
     return book
 }
