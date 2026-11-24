@@ -18,7 +18,14 @@ const defaultParams = () => ({
     standardFontDataUrl: pdfjsPath('standard_fonts/'),
 })
 
+// the latest render of each page document: fixed layout calls `render` again on every
+// resize, so each call builds its own layers and only the latest one puts them in
+const latestRender = new WeakMap()
+
 const render = async (page, doc, zoom) => {
+    const token = {}
+    latestRender.set(doc, token)
+    const stale = () => latestRender.get(doc) !== token
     const scale = zoom * devicePixelRatio
     doc.documentElement.style.transform = `scale(${1 / devicePixelRatio})`
     doc.documentElement.style.transformOrigin = 'top left'
@@ -32,9 +39,11 @@ const render = async (page, doc, zoom) => {
     canvas.width = viewport.width
     const canvasContext = canvas.getContext('2d')
     await page.render({ canvasContext, viewport }).promise
+    if (stale()) return
     doc.querySelector('#canvas').replaceChildren(doc.adoptNode(canvas))
 
-    const container = doc.querySelector('.textLayer')
+    const container = doc.createElement('div')
+    container.className = 'textLayer'
     const textLayer = new pdfjsLib.TextLayer({
         textContentSource: await page.streamTextContent(),
         container, viewport,
@@ -62,7 +71,8 @@ const render = async (page, doc, zoom) => {
     container.onpointerdown = () => container.classList.add('selecting')
     container.onpointerup = () => container.classList.remove('selecting')
 
-    const div = doc.querySelector('.annotationLayer')
+    const div = doc.createElement('div')
+    div.className = 'annotationLayer'
     // pdf.js's IPDFLinkService: a Named action, a SetOCGState, an attachment, a JavaScript or a
     // ResetForm link calls `getAnchorUrl`; without it the layer throws and the page loses all its links
     const linkService = {
@@ -83,6 +93,9 @@ const render = async (page, doc, zoom) => {
     }
     await new pdfjsLib.AnnotationLayer({ page, viewport, div, linkService })
         .render({ annotations: await page.getAnnotations() })
+    if (stale()) return
+    doc.querySelector('.textLayer').replaceWith(container)
+    doc.querySelector('.annotationLayer').replaceWith(div)
 }
 
 const renderPage = async (page, getImageBlob, css) => {
