@@ -63,10 +63,23 @@ const render = async (page, doc, zoom) => {
     container.onpointerup = () => container.classList.remove('selecting')
 
     const div = doc.querySelector('.annotationLayer')
+    // pdf.js's IPDFLinkService: a Named action, a SetOCGState, an attachment, a JavaScript or a
+    // ResetForm link calls `getAnchorUrl`; without it the layer throws and the page loses all its links
     const linkService = {
+        pagesCount: 0,
+        page: 0,
+        rotation: 0,
+        isInPresentationMode: false,
+        externalLinkEnabled: true,
         goToDestination: () => {},
+        goToPage: () => {},
+        goToXY: () => {},
         getDestinationHash: dest => JSON.stringify(dest),
+        getAnchorUrl: () => '#',
         addLinkAttributes: (link, url) => link.href = url,
+        setHash: () => {},
+        executeNamedAction: () => {},
+        executeSetOCGState: () => {},
     }
     await new pdfjsLib.AnnotationLayer({ page, viewport, div, linkService })
         .render({ annotations: await page.getAnnotations() })
