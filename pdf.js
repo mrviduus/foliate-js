@@ -146,6 +146,7 @@ const makeTOCItem = item => ({
 })
 
 /**
+ * `file`: a `File` (read in ranges) or the bytes (`Uint8Array`, `ArrayBuffer`), transferred to pdf.js's worker.
  * `options.css`: the text and annotation layer CSS (default: fetched from `vendor/pdfjs/`).
  * `options.params`: getDocument params (default: cMaps and standard fonts from `vendor/pdfjs/`).
  * The worker is `GlobalWorkerOptions.workerSrc`, unless the host set one up on `globalThis.pdfjsWorker`
@@ -155,14 +156,20 @@ export const makePDF = async (file, { css, params } = {}) => {
     if (!pdfjsLib.GlobalWorkerOptions.workerSrc && !globalThis.pdfjsWorker)
         pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsPath('pdf.worker.mjs')
     css ??= await getDefaultCSS()
-    const transport = new pdfjsLib.PDFDataRangeTransport(file.size, [])
-    transport.requestDataRange = (begin, end) => {
-        file.slice(begin, end).arrayBuffer().then(chunk => {
-            transport.onDataRange(begin, chunk)
-        })
-    }
+    // bytes the host already holds (a `Uint8Array` or `ArrayBuffer`) go to pdf.js as `data`: transferred to
+    // its worker, never copied (the host's buffer is detached); a `File` is read in ranges as before
+    let source
+    if (typeof file?.slice === 'function' && typeof file.arrayBuffer === 'function') {
+        const transport = new pdfjsLib.PDFDataRangeTransport(file.size, [])
+        transport.requestDataRange = (begin, end) => {
+            file.slice(begin, end).arrayBuffer().then(chunk => {
+                transport.onDataRange(begin, chunk)
+            })
+        }
+        source = { range: transport }
+    } else source = { data: file instanceof ArrayBuffer ? new Uint8Array(file) : file }
     const task = pdfjsLib.getDocument({
-        range: transport,
+        ...source,
         ...(params ?? defaultParams()),
         isEvalSupported: false,
     })
