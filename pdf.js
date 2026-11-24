@@ -21,6 +21,10 @@ const defaultParams = () => ({
 // the latest render of each page document: fixed layout calls `render` again on every
 // resize, so each call builds its own layers and only the latest one puts them in
 const latestRender = new WeakMap()
+// the render in progress of each page document: pdf.js's worker answers one call at a time, so a render nobody
+// waits for any more (its frame left the document: a page turned away; or a newer render of the same page)
+// is cancelled when another starts, instead of holding up the page wanted now
+const rendering = new Map()
 
 const render = async (page, doc, zoom, answer) => {
     const token = {}
@@ -38,7 +42,17 @@ const render = async (page, doc, zoom, answer) => {
     canvas.height = viewport.height
     canvas.width = viewport.width
     const canvasContext = canvas.getContext('2d')
-    await answer(page.render({ canvasContext, viewport }).promise)
+    for (const [d, task] of rendering) if (d === doc || !d.defaultView) {
+        rendering.delete(d)
+        task.cancel?.()
+    }
+    const task = page.render({ canvasContext, viewport })
+    rendering.set(doc, task)
+    try {
+        await answer(task.promise)
+    } finally {
+        if (rendering.get(doc) === task) rendering.delete(doc)
+    }
     if (stale()) return
     doc.querySelector('#canvas').replaceChildren(doc.adoptNode(canvas))
 
@@ -152,16 +166,16 @@ const makeTOCItem = item => ({
  * `options.worker`: a function that makes a Web Worker running pdf.worker (the host's own, e.g. from a `blob:`
  * URL), one per document, terminated with it. Otherwise the worker is `GlobalWorkerOptions.workerSrc`, unless
  * the host set one up on `globalThis.pdfjsWorker` (pdf.js then runs it on the main thread).
- * `options.deadline` (ms, 0 = none): a parse (the load, metadata, the outline) pdf.js's worker does not answer in
- * that time terminates the host's worker; every call in flight and every later one reject (a decompression bomb
- * fails instead of running on). `options.pageDeadline` (default `deadline`): the same for each call about one page
- * (the page, its render, text and annotations, the cover), each call timed on its own: a heavy page gets its own
- * budget, not what is left of another's. `options.onFail(error)`: called once when the worker is terminated
- * (a book already on screen stops answering; the host should say so). Without `options.worker` a call only
- * rejects: there is no worker of ours to terminate.
+ * `options.silence` (ms, 0 = none): a watchdog on the worker, not a timer per call (pdf.js's worker answers one call
+ * at a time, so a call's wait in the queue is no sign of trouble). While calls are outstanding, a worker that says
+ * nothing at all for that long (no answer, no message of any kind) is terminated; every call in flight and every
+ * later one reject. Anything it says resets the watchdog: a busy worker that keeps answering is kept, a decompression
+ * bomb (one decode, no word) is not. `options.onFail(error)`: called once when the worker is terminated (a book
+ * already on screen stops answering; the host should say so). Without `options.worker` only the answers reset the
+ * watchdog, and a call only rejects: there is no worker of ours to terminate.
  * Eval stays off (`isEvalSupported: false`, not overridable).
  */
-export const makePDF = async (file, { css, params, worker: makeWorker, deadline = 0, pageDeadline = deadline, onFail } = {}) => {
+export const makePDF = async (file, { css, params, worker: makeWorker, silence = 0, onFail } = {}) => {
     if (!makeWorker && !pdfjsLib.GlobalWorkerOptions.workerSrc && !globalThis.pdfjsWorker)
         pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsPath('pdf.worker.mjs')
     css ??= await getDefaultCSS()
@@ -182,6 +196,7 @@ export const makePDF = async (file, { css, params, worker: makeWorker, deadline 
     // `dead`: the worker was terminated; nothing it was asked answers any more
     let dead = null
     const pending = new Set()
+    let watchdog = null
     const terminate = () => {
         worker?.destroy()
         webWorker?.terminate()
@@ -189,22 +204,30 @@ export const makePDF = async (file, { css, params, worker: makeWorker, deadline 
     const kill = error => {
         if (dead) return
         dead = error
+        clearTimeout(watchdog)
         terminate()
         for (const reject of pending) reject(error)
         pending.clear()
         onFail?.(error)
     }
-    /** `promise` (an answer from the worker), or a rejection: the worker is dead, or did not answer in `ms` */
-    const answer = (promise, ms = deadline) => dead ? Promise.reject(dead) : new Promise((resolve, reject) => {
+    /** The worker said something (or a call settled): the watchdog starts again, if any call is still outstanding. */
+    const heard = () => {
+        clearTimeout(watchdog)
+        watchdog = silence && pending.size && !dead
+            ? setTimeout(() => kill(new Error('this PDF took too long to read')), silence) : null
+    }
+    webWorker?.addEventListener('message', heard)
+    /** `promise` (an answer from the worker), or a rejection: the worker is dead, or went silent */
+    const answer = promise => dead ? Promise.reject(dead) : new Promise((resolve, reject) => {
         pending.add(reject)
-        const timer = ms && setTimeout(() => kill(new Error('this PDF took too long to read')), ms)
+        // a call sent is no word from the worker: only the first outstanding call starts the watchdog
+        if (pending.size === 1) heard()
         promise.then(resolve, reject).finally(() => {
-            clearTimeout(timer)
             pending.delete(reject)
+            heard()
         })
     })
-    const pageAnswer = promise => answer(promise, pageDeadline)
-    // a worker that cannot start (refused, a script error) fails the load at once, not at the deadline
+    // a worker that cannot start (refused, a script error) fails the load at once, not at the watchdog
     const failed = () => kill(new Error('the PDF reader could not start'))
     webWorker?.addEventListener('error', failed)
     const task = pdfjsLib.getDocument({
@@ -257,7 +280,7 @@ export const makePDF = async (file, { css, params, worker: makeWorker, deadline 
         load: () => {
             const cached = cache.get(i)
             cache.delete(i)
-            const entry = cached ?? pageAnswer(pdf.getPage(i + 1))
+            const entry = cached ?? answer(pdf.getPage(i + 1))
             cache.set(i, entry)
             entry.catch(() => cache.get(i) === entry && cache.delete(i))
             for (const [j, old] of cache) {
@@ -266,13 +289,14 @@ export const makePDF = async (file, { css, params, worker: makeWorker, deadline 
                 old.then(page => page.cleanup(), () => {})
             }
             return entry.then(async page => {
-                const { src, onZoom } = await renderPage(page, false, css, pageAnswer)
+                const { src, onZoom } = await renderPage(page, false, css, answer)
                 unloaded.add(src)
                 return { src, onZoom: zoom => {
                     if (unloaded.delete(src)) URL.revokeObjectURL(src)
-                    // a render the terminated worker never answers is reported once, by `onFail`
+                    // a render the terminated worker never answers is reported once, by `onFail`; a cancelled
+                    // one (no longer wanted) is no error
                     return onZoom(zoom).catch(e => {
-                        if (!dead) throw e
+                        if (!dead && e?.name !== 'RenderingCancelledException') throw e
                     })
                 } }
             })
@@ -283,21 +307,21 @@ export const makePDF = async (file, { css, params, worker: makeWorker, deadline 
     book.resolveHref = async href => {
         const parsed = JSON.parse(href)
         const dest = typeof parsed === 'string'
-            ? await answer(pdf.getDestination(parsed), 0) : parsed
+            ? await answer(pdf.getDestination(parsed)) : parsed
         if (dest?.[0] == null) return null
-        const index = await answer(pdf.getPageIndex(dest[0]), 0)
+        const index = await answer(pdf.getPageIndex(dest[0]))
         return { index }
     }
     book.splitTOCHref = async href => {
         const parsed = JSON.parse(href)
         const dest = typeof parsed === 'string'
-            ? await answer(pdf.getDestination(parsed), 0) : parsed
+            ? await answer(pdf.getDestination(parsed)) : parsed
         if (dest?.[0] == null) return null
-        const index = await answer(pdf.getPageIndex(dest[0]), 0)
+        const index = await answer(pdf.getPageIndex(dest[0]))
         return [index, null]
     }
     book.getTOCFragment = doc => doc.documentElement
-    book.getCover = async () => renderPage(await pageAnswer(pdf.getPage(1)), true, null, pageAnswer)
+    book.getCover = async () => renderPage(await answer(pdf.getPage(1)), true, null, answer)
     book.destroy = () => {
         for (const src of unloaded) URL.revokeObjectURL(src)
         unloaded.clear()
