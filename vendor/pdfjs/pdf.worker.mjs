@@ -4215,6 +4215,31 @@ class JBig2CCITTFaxWasmImage {
 
 
 const emptyBuffer = new Uint8Array(0);
+// TextStack #1585 (local patch, re-apply on a pdf.js update): a cap on what one stream decodes to, so a decompression
+// bomb (a page's content inflating to 1-2 GB) fails here, at a few hundred MB, before a phone's memory does (Android
+// kills the whole WebView). 384 MiB keeps the largest legitimate page we read, an A3 scan at 600 dpi (7016x9921 px):
+// 209 MB as RGB, 278 MB as CMYK/RGBA. The async (DecompressionStream) path sizes its output exactly; the sync path's
+// buffer doubles, clamped here to the cap. A DecodedSizeError is not swallowed into the sync fallback; it rejects the
+// call (a page's drawing or text: the host's `book-stopped`; metadata: skipped). A stream past the cap is remembered
+// (by its object id: pdf.js fetches a stream anew for each use) and refused at once after, never inflated again (the
+// page's drawing and text, a re-render, Retry). A failed allocation in the async path is not retried in the sync one.
+const MAX_DECODED_BYTES = 384 * 2 ** 20;
+class DecodedSizeError extends Error {
+  constructor() {
+    super(`a PDF stream decodes past ${MAX_DECODED_BYTES / 2 ** 20} MiB`);
+    this.name = "DecodedSizeError";
+  }
+}
+const tooLargeIds = new Set(); // one worker per document: object ids are unique in it
+function refuseDecode(stream) {
+  stream.decodedTooLarge = true;
+  const id = stream.dict?.objId;
+  if (id) {
+    tooLargeIds.add(id);
+  }
+  return new DecodedSizeError();
+}
+const wasRefused = stream => stream.decodedTooLarge || tooLargeIds.has(stream.dict?.objId);
 class DecodeStream extends BaseStream {
   constructor(maybeMinBufferLength) {
     super();
@@ -4241,10 +4266,14 @@ class DecodeStream extends BaseStream {
     if (requested <= buffer.byteLength) {
       return buffer;
     }
+    if (requested > MAX_DECODED_BYTES || wasRefused(this)) {
+      throw refuseDecode(this);
+    }
     let size = this.minBufferLength;
     while (size < requested) {
       size *= 2;
     }
+    size = Math.min(size, MAX_DECODED_BYTES);
     const buffer2 = new Uint8Array(size);
     buffer2.set(buffer);
     return this.buffer = buffer2;
@@ -4292,6 +4321,9 @@ class DecodeStream extends BaseStream {
     return this.decodeImage(data, length, decoderOptions);
   }
   async asyncGetBytesFromDecompressionStream(name) {
+    if (wasRefused(this)) {
+      throw refuseDecode(this);
+    }
     this.stream.reset();
     const bytes = this.stream.isAsync ? await this.stream.asyncGetBytes() : this.stream.getBytes();
     try {
@@ -4310,6 +4342,9 @@ class DecodeStream extends BaseStream {
       for await (const chunk of readable) {
         chunks.push(chunk);
         totalLength += chunk.byteLength;
+        if (totalLength > MAX_DECODED_BYTES) {
+          throw refuseDecode(this); // leaving the loop cancels the stream
+        }
       }
       const data = new Uint8Array(totalLength);
       let offset = 0;
@@ -4321,7 +4356,10 @@ class DecodeStream extends BaseStream {
         decompressed: data,
         compressed: bytes
       };
-    } catch {
+    } catch (e) {
+      if (e instanceof DecodedSizeError || e instanceof RangeError) {
+        throw e;
+      }
       return {
         decompressed: null,
         compressed: bytes
@@ -5872,6 +5910,9 @@ class JpegStream extends DecodeStream {
       });
       return (await decoder.decode()).image;
     } catch (reason) {
+      if (reason instanceof DecodedSizeError) {
+        throw reason;
+      }
       warn(`getTransferableImage - failed: "${reason}".`);
       return null;
     } finally {
@@ -12519,7 +12560,10 @@ class Jbig2Stream extends DecodeStream {
         }
       }
       this.buffer = await JBig2CCITTFaxWasmImage.decode(bytes, this.dict.get("Width"), this.dict.get("Height"), globals);
-    } catch {
+    } catch (e) {
+      if (e instanceof DecodedSizeError) {
+        throw e;
+      }
       warn("Jbig2Stream: Falling back to JS JBIG2 decoder.");
       return this.decodeImageFallback(bytes, length);
     }

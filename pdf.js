@@ -238,6 +238,9 @@ export const makePDF = async (file, { css, params, worker: makeWorker, silence =
         ...(params ?? defaultParams()),
         worker,
         isEvalSupported: false,
+        // TextStack #1585: an image over 80 M px is skipped (not drawn), not decoded: about an A3 page scanned at
+        // 600 dpi (7016×9921, 69.6 M px) with headroom. A skip, not a stop: the page draws without it.
+        maxImageSize: 80_000_000,
     })
     // the document and its worker go; a worker that does not answer the destroy is terminated anyway
     const close = () => answer(task.destroy()).catch(() => {}).finally(terminate)
