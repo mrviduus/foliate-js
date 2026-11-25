@@ -440,6 +440,7 @@ export class Paginator extends HTMLElement {
     #index = -1
     #anchor = 0 // anchor view to a fraction (0-1), Range, or Element
     #justAnchored = null // the scroll offset an anchored relocate left, or null
+    #loading = null // the view of a display still loading: it relocates nothing
     #locked = false // while true, prevent any further navigation
     #styles
     #styleMap = new WeakMap()
@@ -821,7 +822,7 @@ export class Paginator extends HTMLElement {
             const dir = page <= 0 ? -1 : page >= pages - 1 ? 1 : null
             if (dir) return this.#goTo({
                 index: this.#adjacentIndex(dir),
-                anchor: dir < 0 ? () => 1 : () => 0,
+                anchor: dir < 0 ? 1 : 0,
                 reason: 'turn',
             })
         })
@@ -958,7 +959,7 @@ export class Paginator extends HTMLElement {
     #afterScroll(reason) {
         // (the view may be gone by then: destroy() sets it to null, and the
         // debounced scroll listener can still fire after it)
-        if (!this.#view) return
+        if (!this.#view || this.#loading) return
         const range = this.#getVisibleRange()
         this.#lastVisibleRange = range
         // don't set new anchor if relocation was to scroll to anchor
@@ -982,6 +983,10 @@ export class Paginator extends HTMLElement {
         this.#index = index
         const hasFocus = this.#view?.document?.hasFocus()
         if (src) {
+            // the new view anchors while it loads (to this display's anchor
+            // when known, never to the previous section's place) but does not
+            // relocate: the display's own anchoring below is its first relocate
+            if (typeof anchor !== 'function') this.#anchor = anchor ?? 0
             const view = this.#createView()
             const afterLoad = doc => {
                 if (doc.head) {
@@ -994,7 +999,9 @@ export class Paginator extends HTMLElement {
                 onLoad?.({ doc, index })
             }
             const beforeRender = this.#beforeRender.bind(this)
-            await view.load(src, afterLoad, beforeRender)
+            this.#loading = view
+            try { await view.load(src, afterLoad, beforeRender) }
+            finally { if (this.#loading === view) this.#loading = null }
             this.dispatchEvent(new CustomEvent('create-overlayer', {
                 detail: {
                     doc: view.document, index,
@@ -1038,7 +1045,7 @@ export class Paginator extends HTMLElement {
         if (!this.#view) return true
         if (this.scrolled) {
             if (this.start > 0) return this.#scrollTo(
-                Math.max(0, this.start - (distance ?? this.size)), null, true)
+                Math.max(0, this.start - (distance ?? this.size)), 'page', true)
             return true
         }
         if (this.atStart) return
@@ -1049,7 +1056,7 @@ export class Paginator extends HTMLElement {
         if (!this.#view) return true
         if (this.scrolled) {
             if (this.viewSize - this.end > 2) return this.#scrollTo(
-                Math.min(this.viewSize, distance ? this.start + distance : this.end), null, true)
+                Math.min(this.viewSize, distance ? this.start + distance : this.end), 'page', true)
             return true
         }
         if (this.atEnd) return
@@ -1074,7 +1081,7 @@ export class Paginator extends HTMLElement {
         const shouldGo = await (prev ? this.#scrollPrev(distance) : this.#scrollNext(distance))
         if (shouldGo) await this.#goTo({
             index: this.#adjacentIndex(dir),
-            anchor: prev ? () => 1 : () => 0,
+            anchor: prev ? 1 : 0,
             reason: 'turn',
         })
         if (shouldGo || !this.hasAttribute('animated')) await wait(100)

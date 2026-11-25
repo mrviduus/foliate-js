@@ -340,7 +340,7 @@ export class View extends HTMLElement {
         const pageItem = this.#pageProgress?.getProgress(index, range)
         const cfi = this.getCFI(index, range)
         this.lastLocation = { ...progress, tocItem, pageItem, cfi, range }
-        if (reason === 'snap' || reason === 'page' || reason === 'scroll')
+        if (reason === 'snap' || reason === 'page' || reason === 'scroll' || reason === 'turn')
             this.history.replaceState(cfi)
         this.#emit('relocate', { ...this.lastLocation, reason })
     }
