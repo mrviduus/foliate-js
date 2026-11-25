@@ -579,7 +579,7 @@ export class Paginator extends HTMLElement {
 
         this.addEventListener('relocate', ({ detail }) => {
             if (detail.reason === 'selection') setSelectionTo(this.#anchor, 0)
-            else if (detail.reason === 'navigation') {
+            else if (detail.reason === 'navigation' || detail.reason === 'turn') {
                 if (this.#anchor === 1) setSelectionTo(detail.range, 1)
                 else if (typeof this.#anchor === 'number')
                     setSelectionTo(detail.range, -1)
@@ -822,6 +822,7 @@ export class Paginator extends HTMLElement {
             if (dir) return this.#goTo({
                 index: this.#adjacentIndex(dir),
                 anchor: dir < 0 ? () => 1 : () => 0,
+                reason: 'turn',
             })
         })
     }
@@ -961,7 +962,7 @@ export class Paginator extends HTMLElement {
         const range = this.#getVisibleRange()
         this.#lastVisibleRange = range
         // don't set new anchor if relocation was to scroll to anchor
-        if (reason !== 'selection' && reason !== 'navigation' && reason !== 'anchor')
+        if (reason !== 'selection' && reason !== 'navigation' && reason !== 'anchor' && reason !== 'turn')
             this.#anchor = range
         else this.#justAnchored = this.#container[this.scrollProp]
 
@@ -977,7 +978,7 @@ export class Paginator extends HTMLElement {
         this.dispatchEvent(new CustomEvent('relocate', { detail }))
     }
     async #display(promise) {
-        const { index, src, anchor, onLoad, select } = await promise
+        const { index, src, anchor, onLoad, select, reason } = await promise
         this.#index = index
         const hasFocus = this.#view?.document?.hasFocus()
         if (src) {
@@ -1002,15 +1003,16 @@ export class Paginator extends HTMLElement {
             }))
             this.#view = view
         }
-        await this.scrollToAnchor((typeof anchor === 'function'
-            ? anchor(this.#view.document) : anchor) ?? 0, select)
+        // a section crossed by the reader's own turn says so ('turn'), not 'navigation'
+        await this.#scrollToAnchor((typeof anchor === 'function'
+            ? anchor(this.#view.document) : anchor) ?? 0, reason ?? (select ? 'selection' : 'navigation'))
         if (hasFocus) this.focusView()
     }
     #canGoToIndex(index) {
         return index >= 0 && index <= this.sections.length - 1
     }
-    async #goTo({ index, anchor, select}) {
-        if (index === this.#index) await this.#display({ index, anchor, select })
+    async #goTo({ index, anchor, select, reason }) {
+        if (index === this.#index) await this.#display({ index, anchor, select, reason })
         else {
             const oldIndex = this.#index
             const onLoad = detail => {
@@ -1019,7 +1021,7 @@ export class Paginator extends HTMLElement {
                 this.dispatchEvent(new CustomEvent('load', { detail }))
             }
             await this.#display(Promise.resolve(this.sections[index].load())
-                .then(src => ({ index, src, anchor, onLoad, select }))
+                .then(src => ({ index, src, anchor, onLoad, select, reason }))
                 .catch(e => {
                     console.warn(e)
                     console.warn(new Error(`Failed to load section ${index}`))
@@ -1073,6 +1075,7 @@ export class Paginator extends HTMLElement {
         if (shouldGo) await this.#goTo({
             index: this.#adjacentIndex(dir),
             anchor: prev ? () => 1 : () => 0,
+            reason: 'turn',
         })
         if (shouldGo || !this.hasAttribute('animated')) await wait(100)
         this.#locked = false
