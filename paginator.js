@@ -588,7 +588,7 @@ export class Paginator extends HTMLElement {
             }
         })
         const checkPointerSelection = debounce((range, sel) => {
-            if (!sel.rangeCount) return
+            if (this.#loading || !sel.rangeCount) return
             const selRange = sel.getRangeAt(0)
             const backward = selectionIsBackward(sel)
             if (backward && selRange.compareBoundaryPoints(Range.START_TO_START, range) < 0)
@@ -984,9 +984,10 @@ export class Paginator extends HTMLElement {
         const hasFocus = this.#view?.document?.hasFocus()
         if (src) {
             // the new view anchors while it loads (to this display's anchor
-            // when known, never to the previous section's place) but does not
-            // relocate: the display's own anchoring below is its first relocate
-            if (typeof anchor !== 'function') this.#anchor = anchor ?? 0
+            // when known, else its start; never to the previous document) but
+            // does not relocate: the display's own anchoring below is its first
+            this.#anchor = typeof anchor === 'function' ? 0 : anchor ?? 0
+            this.#lastVisibleRange = null
             const view = this.#createView()
             const afterLoad = doc => {
                 if (doc.head) {
